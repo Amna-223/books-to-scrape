@@ -2,9 +2,11 @@ from pathlib import Path
 from time import sleep
 from datetime import datetime, timezone
 from urllib.parse import urljoin
+import json
 
 import requests
 from bs4 import BeautifulSoup
+from pydantic import BaseModel, HttpUrl, ValidationError
 
 
 BASE_URL = "https://books.toscrape.com/"
@@ -13,12 +15,24 @@ CACHE_DIR = Path("cache")
 HEADERS = {
     "User-Agent": (
         "BooksToScrapeAmna/1.0 "
-        "(+https://github.com/Amna-223/books-to/scrape)"
+        "(+https://github.com/Amna-223/books-to-scrape)"
     )
 }
 
 TIMEOUT = 5
 REQUEST_DELAY = 0.5
+
+
+class BookRecord(BaseModel):
+    title: str
+    product_url: HttpUrl
+    price_text: str
+    price_gbp: float
+    availability_text: str
+    rating_text: str
+    description: str | None
+    source_page: HttpUrl
+    fetched_at: str
 
 
 def fetch_page(url, cache_file):
@@ -89,10 +103,7 @@ def find_next_url(html, page_url):
 
 
 def discover_catalogue_pages():
-    """
-    Discover the first three catalogue pages and keep
-    each book URL associated with its source catalogue page.
-    """
+    """Discover the first three catalogue pages."""
 
     current_url = BASE_URL
     book_sources = {}
@@ -126,7 +137,7 @@ def discover_catalogue_pages():
         current_url = next_url
 
     print(f"catalogue_pages={catalogue_pages}")
-    print(f"discovered={sum(1 for _ in book_sources)}")
+    print(f"discovered={len(book_sources)}")
     print(f"unique_urls={len(book_sources)}")
 
     return book_sources
@@ -158,7 +169,11 @@ def extract_book_details(html, product_url, source_page):
         "#product_description + p"
     )
 
-    title = title_element.get_text(strip=True) if title_element else None
+    title = (
+        title_element.get_text(strip=True)
+        if title_element
+        else None
+    )
 
     price_text = (
         price_element.get_text(strip=True)
@@ -238,11 +253,93 @@ def scrape_book_details(book_sources):
     return records
 
 
+def normalize_price(price_text):
+    """Convert a price like '£51.77' into a number."""
+
+    if not price_text:
+        raise ValueError("Price is missing")
+
+    cleaned = price_text.replace("£", "").strip()
+
+    return float(cleaned)
+
+
+def validate_records(raw_records):
+    """Normalize, deduplicate, and validate records."""
+
+    valid_records = []
+    errors = []
+
+    seen_urls = set()
+
+    for raw_record in raw_records:
+
+        product_url = raw_record["product_url"]
+
+        if product_url in seen_urls:
+            continue
+
+        seen_urls.add(product_url)
+
+        try:
+            normalized_record = {
+                **raw_record,
+                "price_gbp": normalize_price(
+                    raw_record["price_text"]
+                ),
+            }
+
+            book = BookRecord.model_validate(
+                normalized_record
+            )
+
+            valid_records.append(
+                book.model_dump(mode="json")
+            )
+
+        except (ValueError, ValidationError) as error:
+
+            errors.append(
+                {
+                    "product_url": product_url,
+                    "reason": str(error),
+                }
+            )
+
+    return valid_records, errors
+
+
+def save_json(data, file_path):
+    """Save data as formatted JSON."""
+
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+
+    with file_path.open("w", encoding="utf-8") as file:
+        json.dump(
+            data,
+            file,
+            indent=2,
+            ensure_ascii=False,
+        )
+
+
 if __name__ == "__main__":
+
     book_sources = discover_catalogue_pages()
 
-    records = scrape_book_details(book_sources)
+    raw_records = scrape_book_details(book_sources)
 
-    if records:
-        print("\nFirst raw record:")
-        print(records[0])
+    valid_records, errors = validate_records(raw_records)
+
+    save_json(
+        valid_records,
+        Path("output/books.json"),
+    )
+
+    save_json(
+        errors,
+        Path("output/errors.json"),
+    )
+
+    print(f"valid_records={len(valid_records)}")
+    print(f"errors={len(errors)}")
